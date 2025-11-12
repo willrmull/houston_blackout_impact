@@ -1,0 +1,272 @@
+---
+title: "houston_blackout"
+format: pdf
+editor: visual
+execute: 
+  warning: false
+  message: false
+---
+
+---
+title: Spaitial Analysis of the 2021 Power Outage in Houston, Texas
+author: William Mullins
+date: 11-10-2025
+---
+
+```{r, warning = FALSE, message = FALSE}
+reqired_packages <- c("sf", "terra", "tidyverse", "tmap", "here", "stars", "knitr", "units")
+
+for(pkg in reqired_packages){
+  if (!require(pkg, character.only = TRUE)){
+     stop(paste0("Package '", pkg, "' is not installed"))
+  } 
+}
+
+# Load required packages
+suppressPackageStartupMessages({
+  library(sf)
+  library(tmap)
+  library(tidyverse)
+  library(here)
+  library(knitr)
+  library(patchwork)
+  library(paletteer)
+  library(units)
+})
+```
+
+### Data Import
+
+```{r, warning = FALSE, message = FALSE}
+# Feb 7 Data
+nl_1_07 <- rast(here("data", "VNP46A1", "VNP46A1.A2021038.h08v05.001.2021039064328.tif"))
+nl_2_07 <- rast(here("data", "VNP46A1", "VNP46A1.A2021038.h08v06.001.2021039064329.tif"))
+
+# Feb 16 Data
+nl_1_16 <- rast(here("data", "VNP46A1", "VNP46A1.A2021047.h08v05.001.2021048091106.tif"))
+nl_2_16 <- rast(here("data", "VNP46A1", "VNP46A1.A2021047.h08v06.001.2021048091105.tif"))
+
+# Read In cencus geometry data
+census_data_geometry <- st_read(dsn = "data/ACS_2019_5YR_TRACT_48_TEXAS.gdb", 
+                       layer =  "ACS_2019_5YR_TRACT_48_TEXAS") %>% 
+  st_transform(crs = 3083) # Change to desired crs
+
+# Combine nightlight data by date
+# Data from 2021-02-07
+feb_7_comb <- mosaic(nl_1_07, nl_2_07) 
+# Data from 2021-02-16
+feb_16_comb <- mosaic(nl_1_16, nl_2_16) 
+```
+
+### Comparison of the Beofre and of the Outage
+
+```{r, warning = FALSE, message = FALSE}
+plot_one_data <- c(feb_7_comb, feb_16_comb)
+names(plot_one_data) <- c("Radiance \n(nW cm²/sr)", "Other")
+tm_shape(plot_one_data) +
+ tm_graticules(crs = 4326, labels.show = TRUE) +
+ tm_raster(col.scale = tm_scale_intervals(values = "-viridis",
+                                          style = "quantile", )) +
+  tm_title("Nighttime Light in Houston Texas Before and During the Outage") +
+  tm_facets(ncol = 2, 
+            free.scales = FALSE, 
+            drop.units = TRUE) +
+  tm_layout(panel.labels = c("February 7, 2021", "February 16, 2021"),
+            legend.position = tm_pos_out("left", "center", pos.v = "center"))
+```
+
+### Identifying Sites With Blackouts
+```{r, warning = FALSE, message = FALSE}
+# Find the difference in light between the two days
+light_change <- feb_16_comb - feb_7_comb
+
+# Set non-significant areas to NA
+light_change[light_change <= 200] <- NA
+
+light_change_vector <- terra::as.points(light_change, na.rm = TRUE)
+
+blackouts <- light_change_vector %>% 
+  st_as_sf() %>%# Converts to an sf
+  st_make_valid() %>% # Remove NA rows
+  st_transform(3083) # Change to desired CRS
+
+
+# Create bounding box for Houston
+custom_bbox <- c(xmin = -96.5, xmax = -94.5, ymin = 29, ymax = 30.5)
+# Convert convert bbox to a sf object
+bbox_sfc <- st_bbox(custom_bbox) %>% 
+  st_as_sfc() %>%
+  st_set_crs(4326) %>%
+  st_transform(3083) 
+
+# Filter blackout data to be within the bounding box
+blackouts_intersection <- st_intersects(blackouts, bbox_sfc, sparse = FALSE)
+blackouts_cropped <- blackouts[blackouts_intersection,]
+```
+
+
+### Exclude Sites Within 200 Meters of a Road
+```{r, warning = FALSE, message = FALSE}
+# Road Data
+roads <-read_sf(here::here("data", "gis_osm_roads_free_1.gpkg"), 
+                query = "SELECT * FROM gis_osm_roads_free_1 WHERE fclass='motorway'"
+)
+
+if (st_crs(roads) != st_crs(blackouts_cropped)) {
+  roads <- st_transform(roads, crs = st_crs(blackouts_cropped)) 
+}
+
+# Change the road data to have a 200m buffer
+road_buffer <- st_buffer(st_union(st_geometry(roads)), dist = set_units(200, "m"))
+
+# Create a logical vector of the intersections
+close_to_roads <- st_intersects(
+  st_geometry(blackouts_cropped), 
+  road_buffer,
+  sparse = FALSE
+) %>%
+  rowSums() %>% # Get the number of intersections
+  as.logical() # Store as a True/False value
+
+# Return data frame where there was not intersection
+blackouts_roads <- blackouts_cropped[!close_to_roads,]
+
+# Check that the CRS match before plotting
+if(st_crs(census_data_geometry) != st_crs(blackouts_roads)) {
+  message("Warning! CRS do onot match")
+}
+# Plot the areas that experienced blackouts
+tm_shape(census_data_geometry, bbox = bbox_sfc) +
+  tm_graticules(crs = 3083, labels.show = TRUE) +
+  tm_borders(fill = "lightgrey",
+             lwd = 0.5) +
+  tm_shape(blackouts_roads) +
+  tm_polygons(col = "#008080") + 
+  tm_compass(position = c("right", "bottom"), size = 0.5) +
+  tm_title(text = "Areas Affected by February 2021 Blackout") 
+```
+
+### Locating Where Homes Experienced Blackouts
+
+```{r, warning = FALSE, message = FALSE}
+# Houses
+houses <- read_sf(here::here("data", "gis_osm_buildings_a_free_1.gpkg"), query = "
+    SELECT *
+    FROM gis_osm_buildings_a_free_1
+    WHERE (type IS NULL AND name IS NULL)
+       OR type IN ('residential', 'apartments', 'house', 'static_caravan', 'detached')
+  ")
+
+# Check if CRS match. If not then make them match
+if (st_crs(houses) != st_crs(blackouts_roads)) {
+  houses <- st_transform(houses, crs = st_crs(blackouts_roads)) 
+}
+
+# Data frame of houses that had blackouts.
+blackouts_houses <- st_join(houses, blackouts_roads, join = st_intersects, left = FALSE)
+```
+
+
+```{r, warning = FALSE, message = FALSE}
+# Plot the houses which experienced a blackout
+tm_shape(census_data_geometry, bbox = bbox_sfc) +
+  tm_graticules(crs = 3083, labels.show = TRUE) +
+  tm_borders(fill = "lightgrey",
+             lwd = 0.5) +
+  tm_shape(blackouts_houses) +
+  tm_dots(fill = "#008080",
+          size = 0.5) + 
+  tm_compass(position = c("right", "bottom"), size = 0.5) +
+  tm_title(text = "Houses Which Experienced Power Outages February 2021") 
+```
+
+### Estimate of the Number of Houses With Outages
+
+```{r, warning = FALSE, message = FALSE}
+estimate <- blackouts_houses %>%  
+ st_drop_geometry() %>%
+ filter(fclass == 'building') %>% 
+ summarize(home_count = n())
+```
+
+An estimated 211 homes where affected by the blackout
+
+### Socioeconomic Variables
+
+```{r, warning = FALSE, message = FALSE}
+# Census income data
+suppressMessages(
+census_data_income <- st_read(dsn = "data/ACS_2019_5YR_TRACT_48_TEXAS.gdb", 
+                       layer =  "X19_INCOME")
+ )
+
+# Keep columns containing the GEOID and the median income
+median_income_data <- census_data_income %>%
+  dplyr::select("GEOID", "B19013e1") 
+
+# Left join geometry and income data by their respective GEOID columns
+median_income_data <- dplyr::left_join(
+  census_data_geometry, 
+  median_income_data, 
+  
+  by = c("GEOID_Data" = "GEOID")
+)
+
+# Get tracts where there was an outage
+tracts_with_blackouts <- st_join(median_income_data,
+                                 blackouts_roads,
+                                 join = st_intersects,
+                                 left = FALSE)
+```
+
+### Site Classification
+```{r, warning = FALSE, message = FALSE}
+# Create new column and assign "no" to it as a default
+median_income_data$blackout <- "No"
+
+# Go through each row and check if there was a  blackout
+for (i in 1:nrow(median_income_data)) {
+  current_row <- median_income_data$TRACTCE[i]
+  
+  # Check if this ID exists in new_data
+  if (current_row %in% tracts_with_blackouts$TRACTCE) {
+    median_income_data$blackout[i] <- "Yes"
+  }
+  # Otherwise it remains "no" (already initialized)
+}
+```
+
+### Census Tracts Which Experienced Outages
+
+```{r, warning = FALSE, message = FALSE}
+custom_palette <- c("#f5deb3", "#008080")
+
+tm_shape(median_income_data, bbox = bbox_sfc) + 
+  tm_polygons("blackout",
+              fill.scale = tm_scale(values = custom_palette, 
+                                    labels = c("No", "Yes")),
+              fill.legend = tm_legend(title = "Blackout \n Tract", 
+                                      title.size = 1,
+                                      text.size = .7),
+              lwd = 0.1,
+              ) +
+  tm_compass(position = c("right", "bottom"), size = 0.5) +
+  tm_title('Cencus Tracts With Blackouts in Houston')
+```
+
+### Box PLot of Median Income vs. Blackout Occcurance
+```{r, warning = FALSE, message = FALSE}
+ggplot(data = median_income_data, aes(x = blackout, y = B19013e1)) +
+  scale_fill_manual(values = custom_palette,  # Colorblind-safe colors
+    labels = c("No Blackout", "Blackout")) +
+  geom_boxplot(fill = custom_palette) +
+  labs(
+    title = "Median Household Income by Blackout Status",
+    x = "Power Outage",
+    y = "Median Household Income (USD)"
+  ) + 
+  theme_minimal(base_size = 14)
+```
+
+### Reflection 
+Our results suggest that there seems to be a fairly small amount of correlation between the median income of people and whether or not they experienced a power outage at that time. This does not exclude the possibility of income playing a role in power outages, however, as the methods used to approximate this are limited. Rather than examining the median income of the houses directly, the median income of entire tracts is being used. This means that if just one household has a blackout during this time, its entire census tract will be reported as having experienced outages. In the future, it would be better to examine the proportion of tracts that experienced outages compared to the median income in that area.
